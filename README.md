@@ -13,7 +13,7 @@ and excessive focus on local information. This approach mirrors the human eye’
 |SSViT-T|15M|2.4G|83.0%|[SSViT-T(epoch297)](SSViT_log/SSViT-T.txt)|
 |SSViT-S|27M|4.4G|84.4%|[SSViT-S(epoch244)](SSViT_log/SSViT-S.txt)|
 |SSViT-B|57M|9.6G|85.3%|[SSViT-B(epoch236)](SSViT_log/SSViT-B.txt)|
-|SSViT-L|100M|18.2G|85.6%|[SSViT-L(epoch231)](SSViT_log/SSViT-L.txt)|
+|SSViT-L|100M|18.2G|85.7%|[SSViT-L(epoch214)](SSViT_log/SSViT-L.txt)|
 
 ## Citation
 
