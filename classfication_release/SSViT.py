@@ -274,7 +274,7 @@ class SSViT(nn.Module):
     def __init__(self, in_chans=3, num_classes=1000, 
                  embed_dims=[96, 192, 384, 768], depths=[2, 2, 6, 2], num_heads=[3, 6, 12, 24], window_sizess=[[7, 8], [7, 4], [7, 2]*3, [7, 7]],
                  is_reversess=[[False, True], [False, True], [False, True], [False, True]], mlp_ratios=[3, 3, 3, 3], drop_path_rate=0.1, 
-                 projection=1024, layerscales=[False, False, False, False], layer_init_values=1e-6):
+                 layerscales=[False, False, False, False], layer_init_values=1e-6):
         super().__init__()
 
         self.num_classes = num_classes
