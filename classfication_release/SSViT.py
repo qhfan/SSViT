@@ -11,13 +11,85 @@ import torch.nn as nn
 from timm.models.layers import DropPath, trunc_normal_
 from timm.models.registry import register_model
 from timm.models.vision_transformer import _cfg
+from fvcore.nn import FlopCountAnalysis, flop_count_table
 import time
 from einops import rearrange, einsum
 from einops.layers.torch import Rearrange
 from typing import Tuple
 
+from natten import NeighborhoodAttention2D
 from natten.functional import natten2dqkrpb, natten2dav
 
+class SwishImplementation(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, i):
+        result = i * torch.sigmoid(i)
+        ctx.save_for_backward(i)
+        return result
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        i = ctx.saved_tensors[0]
+        sigmoid_i = torch.sigmoid(i)
+        return grad_output * (sigmoid_i * (1 + i * (1 - sigmoid_i)))
+
+class MemoryEfficientSwish(nn.Module):
+    def forward(self, x):
+        return SwishImplementation.apply(x)
+
+def rotate_every_two(x):
+    x1 = x[:, :, :, :, ::2]
+    x2 = x[:, :, :, :, 1::2]
+    x = torch.stack([-x2, x1], dim=-1)
+    return x.flatten(-2)
+
+def theta_shift(x, sin, cos):
+    return (x * cos) + (rotate_every_two(x) * sin)
+
+class RoPE(nn.Module):
+
+    def __init__(self, embed_dim, num_heads):
+        '''
+        recurrent_chunk_size: (clh clw)
+        num_chunks: (nch ncw)
+        clh * clw == cl
+        nch * ncw == nc
+
+        default: clh==clw, clh != clw is not implemented
+        '''
+        super().__init__()
+        angle = 1.0 / (10000 ** torch.linspace(0, 1, embed_dim // num_heads // 4))
+        angle = angle.unsqueeze(-1).repeat(1, 2).flatten()
+        self.register_buffer('angle', angle)
+
+    
+    def forward(self, slen: Tuple[int]):
+        '''
+        slen: (h, w)
+        h * w == l
+        recurrent is not implemented
+        '''
+        # index = torch.arange(slen[0]*slen[1]).to(self.angle)
+        index_h = torch.arange(slen[0]).to(self.angle)
+        index_w = torch.arange(slen[1]).to(self.angle)
+        # sin = torch.sin(index[:, None] * self.angle[None, :]) #(l d1)
+        # sin = sin.reshape(slen[0], slen[1], -1).transpose(0, 1) #(w h d1)
+        sin_h = torch.sin(index_h[:, None] * self.angle[None, :]) #(h d1//2)
+        sin_w = torch.sin(index_w[:, None] * self.angle[None, :]) #(w d1//2)
+        sin_h = sin_h.unsqueeze(1).repeat(1, slen[1], 1) #(h w d1//2)
+        sin_w = sin_w.unsqueeze(0).repeat(slen[0], 1, 1) #(h w d1//2)
+        sin = torch.cat([sin_h, sin_w], -1) #(h w d1)
+        # cos = torch.cos(index[:, None] * self.angle[None, :]) #(l d1)
+        # cos = cos.reshape(slen[0], slen[1], -1).transpose(0, 1) #(w h d1)
+        cos_h = torch.cos(index_h[:, None] * self.angle[None, :]) #(h d1//2)
+        cos_w = torch.cos(index_w[:, None] * self.angle[None, :]) #(w d1//2)
+        cos_h = cos_h.unsqueeze(1).repeat(1, slen[1], 1) #(h w d1//2)
+        cos_w = cos_w.unsqueeze(0).repeat(slen[0], 1, 1) #(h w d1//2)
+        cos = torch.cat([cos_h, cos_w], -1) #(h w d1)
+
+        retention_rel_pos = (sin, cos)
+
+        return retention_rel_pos
 
 class LayerNorm2d(nn.Module):
     def __init__(self, dim, eps=1e-6):
@@ -39,7 +111,7 @@ def toodd(size: int):
     else:
         return size + 1
 
-class S3A(nn.Module):
+class ConvDecop(nn.Module):
 
     def __init__(self, embed_dim, num_heads, window_size, is_reverse):
         super().__init__()
@@ -59,7 +131,7 @@ class S3A(nn.Module):
         nn.init.xavier_normal_(self.out_proj.weight, gain=2 ** -2.5)
         nn.init.constant_(self.out_proj.bias, 0.0)
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor, sin: torch.Tensor, cos: torch.Tensor):
         '''
         x: (b c h w)
         sin: (h w d)
@@ -70,6 +142,9 @@ class S3A(nn.Module):
         lepe = self.lepe(qkv[:, 2*self.embed_dim:, :, :])
 
         q, k, v = rearrange(qkv, 'b (m n d) h w -> m b n h w d', m=3, n=self.num_heads)
+
+        q = theta_shift(q, sin, cos)
+        k = theta_shift(k, sin, cos)
 
         k = k * self.scaling
         if not self.is_reverse:
@@ -105,7 +180,7 @@ class FeedForwardNetwork(nn.Module):
         activation_fn=F.gelu,
         dropout=0.0,
         activation_dropout=0.0,
-        subconv=False
+        subconv=True
         ):
         super().__init__()
         self.embed_dim = embed_dim
@@ -143,7 +218,7 @@ class Block(nn.Module):
         self.layerscale = layerscale
         self.embed_dim = embed_dim
         self.norm1 = LayerNorm2d(embed_dim, eps=1e-6)
-        self.attn = S3A(embed_dim, num_heads, window_size, is_reverse)
+        self.attn = ConvDecop(embed_dim, num_heads, window_size, is_reverse)
         self.drop_path = DropPath(drop_path)
         self.norm2 = LayerNorm2d(embed_dim, eps=1e-6)
         self.ffn = FeedForwardNetwork(embed_dim, ffn_dim)
@@ -153,13 +228,13 @@ class Block(nn.Module):
             self.gamma_1 = nn.Parameter(layer_init_values * torch.ones(1, embed_dim, 1, 1),requires_grad=True)
             self.gamma_2 = nn.Parameter(layer_init_values * torch.ones(1, embed_dim, 1, 1),requires_grad=True)
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor, sin: torch.Tensor, cos: torch.Tensor):
         x = x + self.pos(x)
         if self.layerscale:
-            x = x + self.drop_path(self.gamma_1 * self.attn(self.norm1(x)))
+            x = x + self.drop_path(self.gamma_1 * self.attn(self.norm1(x), sin, cos))
             x = x + self.drop_path(self.gamma_2 * self.ffn(self.norm2(x)))
         else:
-            x = x + self.drop_path(self.attn(self.norm1(x)))
+            x = x + self.drop_path(self.attn(self.norm1(x), sin, cos))
             x = x + self.drop_path(self.ffn(self.norm2(x)))
         return x
 
@@ -214,6 +289,7 @@ class BasicLayer(nn.Module):
         super().__init__()
         self.embed_dim = embed_dim
         self.depth = depth
+        self.RoPE = RoPE(embed_dim, num_heads)
 
         # build blocks
         self.blocks = nn.ModuleList([
@@ -229,8 +305,9 @@ class BasicLayer(nn.Module):
 
     def forward(self, x: torch.Tensor):
         _, _, h, w = x.size()
+        sin, cos = self.RoPE((h, w))
         for blk in self.blocks:
-            x = blk(x)
+            x = blk(x, sin, cos)
         if self.downsample is not None:
             x = self.downsample(x)
         return x
@@ -269,12 +346,12 @@ class PatchEmbed(nn.Module):
         x = self.proj(x)#(b c h w)
         return x
 
-class SSViT(nn.Module):
+class CDFormer(nn.Module):
 
     def __init__(self, in_chans=3, num_classes=1000, 
                  embed_dims=[96, 192, 384, 768], depths=[2, 2, 6, 2], num_heads=[3, 6, 12, 24], window_sizess=[[7, 8], [7, 4], [7, 2]*3, [7, 7]],
                  is_reversess=[[False, True], [False, True], [False, True], [False, True]], mlp_ratios=[3, 3, 3, 3], drop_path_rate=0.1, 
-                 layerscales=[False, False, False, False], layer_init_values=1e-6):
+                 projection=1024, layerscales=[False, False, False, False], layer_init_values=1e-6):
         super().__init__()
 
         self.num_classes = num_classes
@@ -308,9 +385,11 @@ class SSViT(nn.Module):
             )
             self.layers.append(layer)
             
-        self.norm = nn.BatchNorm2d(self.num_features)
+        self.proj = nn.Conv2d(self.num_features, projection, 1)
+        self.norm = nn.BatchNorm2d(projection)
+        self.swish = MemoryEfficientSwish()
         self.avgpool = nn.AdaptiveAvgPool2d(1)
-        self.head = nn.Conv2d(self.num_features, num_classes, 1) if num_classes > 0 else nn.Identity()
+        self.head = nn.Conv2d(projection, num_classes, 1) if num_classes > 0 else nn.Identity()
 
         self.apply(self._init_weights)
 
@@ -340,7 +419,10 @@ class SSViT(nn.Module):
         for layer in self.layers:
             x = layer(x)
 
+        x = self.proj(x) #(b c h w)
         x = self.norm(x) #(b c h w)
+        x = self.swish(x)
+
         x = self.avgpool(x)  # B C 1 1
         return x
 
@@ -351,8 +433,8 @@ class SSViT(nn.Module):
         return x
 
 @register_model
-def SSViT_T(args):
-    model = SSViT(
+def CDFormer_T(args):
+    model = CDFormer(
         embed_dims=[64, 128, 256, 512],
         depths=[2, 2, 9, 2],
         num_heads=[2, 4, 8, 16],
@@ -366,8 +448,8 @@ def SSViT_T(args):
     return model
 
 @register_model
-def SSViT_S(args):
-    model = SSViT(
+def CDFormer_S(args):
+    model = CDFormer(
         embed_dims=[64, 128, 256, 512],
         depths=[3, 5, 18, 4],
         num_heads=[2, 4, 8, 16],
@@ -382,8 +464,8 @@ def SSViT_S(args):
 
 
 @register_model
-def SSViT_M(args):
-    model = SSViT(
+def CDFormer_M(args):
+    model = CDFormer(
         embed_dims=[80, 160, 320, 512],
         depths=[4, 9, 25, 9],
         num_heads=[5, 5, 10, 16],
@@ -399,8 +481,8 @@ def SSViT_M(args):
 
 
 @register_model
-def SSViT_L(args):
-    model = SSViT(
+def CDFormer_L(args):
+    model = CDFormer(
         embed_dims=[112, 224, 448, 640],
         depths=[4, 9, 25, 9],
         num_heads=[7, 7, 14, 20],
@@ -413,7 +495,6 @@ def SSViT_L(args):
     )
     model.default_cfg = _cfg()
     return model
-
 
 
 
