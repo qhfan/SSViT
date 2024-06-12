@@ -10,12 +10,12 @@ and excessive focus on local information. This approach mirrors the human eye’
 
 
 ### Results
-|Model|Params|FLOPs|Acc|log|
-|:---:|:---:|:---:|:---:|:---:|
-|SSViT-T|15M|2.4G|83.0%|[SSViT-T(epoch297)](SSViT_log/SSViT-T.txt)|
-|SSViT-S|27M|4.4G|84.4%|[SSViT-S(epoch244)](SSViT_log/SSViT-S.txt)|
-|SSViT-B|57M|9.6G|85.3%|[SSViT-B(epoch295)](SSViT_log/SSViT-B.txt)|
-|SSViT-L|100M|18.2G|85.7%|[SSViT-L(epoch214)](SSViT_log/SSViT-L.txt)|
+|Model|Params|FLOPs|Acc|log|ckpt|
+|:---:|:---:|:---:|:---:|:---:|:---:|
+|SSViT-T|15M|2.4G|83.0%|[SSViT-T(epoch297)](SSViT_log/SSViT-T.txt)|[SSViT-T](https://pan.baidu.com/s/1tUVtDmp2WJqUms3HZODzBg?pwd=xs4c)|
+|SSViT-S|27M|4.4G|84.4%|[SSViT-S(epoch244)](SSViT_log/SSViT-S.txt)|[SSViT-S](https://pan.baidu.com/s/1QDNfGgxXBhzKWh1vO0rVlA?pwd=ehvz)|
+|SSViT-B|57M|9.6G|85.3%|[SSViT-B(epoch295)](SSViT_log/SSViT-B.txt)|[SSViT-B](https://pan.baidu.com/s/1ribfXbjrPexvOK8N6XOwRw?pwd=8tx6)|
+|SSViT-L|100M|18.2G|85.7%|[SSViT-L(epoch214)](SSViT_log/SSViT-L.txt)|[SSViT-L](https://pan.baidu.com/s/1xjp0X1q8WoiLZPFpRRh43Q?pwd=4nxm)|
 
 ## Citation
 
